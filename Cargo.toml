@@ -1,0 +1,49 @@
+[workspace]
+members = ["fury-core", "fury-sign", "fury-chat"]
+resolver = "3"
+
+[workspace.dependencies]
+# Crypto & Identity
+bip39 = "2.0"
+bip32 = "0.5"                                             # BIP-32 HD key derivation (replaces tiny-hdkd)
+k256 = { version = "0.13", features = ["ecdsa", "schnorr", "sha256", "ecdh"] }
+
+# Transport & Signaling
+nostr-sdk = "0.30"
+webrtc = "0.11"
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.21", features = ["rustls-tls-webpki-roots"] }
+url = "2"
+
+# Privacy — embedded Tor via Arti (no external daemon required)
+arti-client = { version = "0.20", features = ["tokio", "rustls"] }
+tor-rtcompat = { version = "0.20", features = ["tokio", "rustls"] }
+
+# MLS group messaging — openmls when integration begins
+# openmls = "0.5"
+
+hkdf = "0.12"
+hmac = "0.12"
+chacha20poly1305 = "0.10"
+chacha20 = "0.9"
+rand = "0.8"
+base64 = "0.22"
+
+secrecy = "0.8"
+zeroize = { version = "1.7", features = ["derive"] }
+memsec = "0.6"  # mlock/munlock for heap memory locking
+thiserror = "1"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hex = "0.4"
+sha2 = "0.10"
+bech32 = "0.9"
+
+# Async / networking utilities
+futures = "0.3"
+anyhow = "1"
+
+tracing = "0.1"
+tracing-subscriber = "0.3"
