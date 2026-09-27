@@ -3,14 +3,15 @@
 ## Current State
 
 ```
-fury-core   ✅ identity.rs  — BIP-32 NIP-06 derivation, BIP-340 Schnorr, mlock, ECDH
+fury-core   ✅ identity.rs  — BIP-32 NIP-06 derivation, BIP-340 Schnorr, mlock, ECDH, EVM/BTC wallet keys
             ✅ event.rs     — NIP-01 event construction, SHA-256 ID, Schnorr verify
-            ✅ nip44.rs     — NIP-44 v2 (ECDH + HKDF + ChaCha20-Poly1305 + HMAC)
+            ✅ nip44.rs     — NIP-44 v2 (ECDH + HKDF + ChaCha20 + HMAC-SHA256), official vectors
             ✅ error.rs     — FuryError enum, FuryResult<T>
-            🔲 transport.rs — not started (Arti/Tor; direct WebSocket works today)
+            ✅ transport.rs — Arti/Tor relay client (publish / subscribe), no direct path
 fury-sign   🔲 main.rs      — identity CLI stub (generate / show / import not yet implemented)
             🔲 storage.rs   — encrypted-at-rest mnemonic persistence (not started)
-fury-chat   ✅ main.rs      — two-terminal NIP-44 encrypted chat (direct relay, no Tor)
+fury-chat   ✅ main.rs      — two-terminal NIP-44 encrypted chat, Tor-routed
+            ⚠ uses kind-4 events: leaks the communication graph (see M3.5, SECURITY.md)
 ```
 
 ---
@@ -20,10 +21,11 @@ fury-chat   ✅ main.rs      — two-terminal NIP-44 encrypted chat (direct rela
 | # | Name | Crate(s) | Delivers |
 |---|------|----------|---------|
 | M0 | Foundation | fury-core | Identity + error model ✅ |
-| M1 | Full key ring | fury-core | All coin keys + public-key extraction |
+| M1 | Full key ring | fury-core | All coin keys + public-key extraction ✅ |
 | M2 | Nostr event + NIP-44 | fury-core | NIP-01 events, NIP-44 v2 encryption ✅ |
 | M2.5 | Two-terminal chat demo | fury-chat | Working CLI chat over live relay ✅ |
-| M3 | Tor transport (Arti) | fury-core | All relay connections through embedded Tor |
+| M3 | Tor transport (Arti) | fury-core | All relay connections through embedded Tor ✅ |
+| M3.5 | Metadata-private DMs | fury-core, fury-chat | NIP-17 / NIP-59 gift wrap; hides the sender from relays, reduces the communication-graph leak |
 | M4 | Encrypted storage | fury-sign | At-rest mnemonic protection |
 | M5 | Full chat protocol | fury-chat | ChatSession API, MLS groups, Tor-routed |
 | M5.5 | Push notifications | fury-push | Contentless APNs/FCM + optional UnifiedPush |
@@ -191,19 +193,20 @@ The canonical serialization must produce compact JSON with no whitespace, and fi
 
 ### New file: `fury-core/src/nip44.rs`
 
-**NIP-44 v2 spec (XChaCha20-Poly1305 + HKDF-SHA256):**
+**NIP-44 v2 spec (ChaCha20 + HMAC-SHA256 + HKDF-SHA256; no Poly1305):**
 
 ```
-conversation_key = HMAC-SHA256(key=priv_a_bytes XOR priv_b_bytes, msg=pub_b_xonly || pub_a_xonly)
- -- actually: --
-conversation_key = secp256k1_ECDH(priv_a, pub_b)  [x-coordinate only, no hashing]
-message_key      = HKDF-SHA256(ikm=conversation_key, salt=nonce[0..24], info="nip44-v2", len=76)
-    → chacha_key     = message_key[0..32]
-    → chacha_nonce   = message_key[32..44]
-    → hmac_key       = message_key[44..76]
-ciphertext       = XChaCha20-Poly1305-Encrypt(key=chacha_key, nonce=chacha_nonce, plaintext)
+shared_x         = secp256k1_ECDH(priv_a, pub_b)          [x-coordinate only]
+conversation_key = HKDF-extract(salt="nip44-v2", ikm=shared_x)
+nonce            = random 32 bytes
+message_keys     = HKDF-expand(prk=conversation_key, info=nonce, len=76)
+    → chacha_key     = message_keys[0..32]
+    → chacha_nonce   = message_keys[32..44]
+    → hmac_key       = message_keys[44..76]
+padded           = u16_be(len) || plaintext || zeros      [calc_padded_len; plaintext 1..65535 bytes]
+ciphertext       = ChaCha20(key=chacha_key, nonce=chacha_nonce, padded)
 mac              = HMAC-SHA256(key=hmac_key, msg=nonce || ciphertext)
-payload          = base64( version[1] || nonce[32] || ciphertext || mac[32] )
+payload          = base64( 0x02 || nonce[32] || ciphertext || mac[32] )
 ```
 
 ```rust
@@ -366,6 +369,39 @@ let (ws, _) = tokio_tungstenite::client_async_tls(relay_url, tor_stream).await?;
 **Note on testing Tor in CI:** real Tor circuit tests are slow and network-dependent. Mock relay tests (no Tor, just WebSocket protocol) run in CI without `#[ignore]`. The Tor integration test is marked `#[ignore]` and runs manually or in a dedicated privacy-test job.
 
 **Mock relay:** implement a minimal `tokio::net::TcpListener`-based WebSocket echo relay in `fury-core/tests/mock_relay.rs`. Accepts `["EVENT", ...]` frames, echoes back `["OK", id, true, ""]` and `["EVENT", sub_id, event]`.
+
+---
+
+## M3.5 — Metadata-private DMs (NIP-17 / NIP-59)
+
+### Goal
+Reduce the communication-graph leak by hiding the sender from relays. (The recipient's inbox
+relay still sees when messages arrive for it; see SECURITY.md → What remains.) Kind-4 DMs expose the sender and recipient long-term
+pubkeys, and the exact time, to every relay and to anyone who queries it (SECURITY.md →
+Communication graph leak).
+
+### Scope
+- `fury-core/src/nip59.rs`: build the rumor (kind 14, unsigned), the seal (kind 13, signed by
+  the sender, NIP-44 to the recipient) and the gift wrap (kind 1059, signed by a new random key
+  for each message, NIP-44 to the recipient, `created_at` randomised by 0–2 days into the past).
+  Unwrap in reverse, and check that the seal's pubkey equals the rumor's pubkey.
+- `fury-chat`: publish only kind 1059, and subscribe only to `{"kinds":[1059], "#p":[me]}`, with
+  no `authors` filter. Stop publishing kind 4.
+- Publish a kind-10050 inbox relay list. When sending, deliver to the recipient's inbox relays.
+- Relays that require NIP-42 AUTH before serving kind 1059 are preferred, and this is the
+  default for the FURY-hosted relay tier.
+- Send a copy wrapped to yourself, so your own devices see sent messages.
+
+### Tests
+| Test | Expected |
+|------|----------|
+| NIP-59 wrap/unwrap roundtrip | plaintext and sender recovered |
+| Gift wrap pubkey | differs from the sender's pubkey, and is new for every message |
+| `created_at` fuzz | within [now − 2 days, now] |
+| Seal/rumor pubkey mismatch | rejected |
+| Regression: published DM events | the user's long-term pubkey appears nowhere except as the gift wrap's recipient `p` tag |
+| Regression: DM subscription filters | contain no `authors` field |
+| Interop | a message from a reference NIP-17 client decrypts in fury-chat, and the reverse |
 
 ---
 
@@ -560,7 +596,12 @@ Registration flow:
 3. `fury-push` subscribes to `{"#t": [opaque_token]}` — never sees the pubkey filter
 4. On event arrival: fire ping, done
 
-This decouples the push proxy from identity — even a compromised `fury-push` server cannot correlate device tokens to Nostr pubkeys.
+> **Correction:** this does **not** separate the push proxy from identity. The proxy receives
+> the full event, which carries the recipient's `#p` tag next to the `#t` token. So it learns
+> which device token belongs to which pubkey. Under NIP-17 (M3.5) the gift wrap still carries
+> the recipient `p` tag. Until pairwise receiving keys exist, treat the push proxy as knowing
+> device ↔ recipient pubkey: recommend a self-hosted proxy or UnifiedPush distributor, and
+> document the linkage for the hosted proxy. See SECURITY.md → Communication graph leak, step 4.
 
 ### UnifiedPush backend
 
@@ -803,6 +844,7 @@ M0: cargo check + cargo test -p fury-core (NIP-06 vectors)
 M1: M0 + wallet key derivation tests + npub roundtrip
 M2: M1 + NIP-44 v2 official vectors + event sign/verify
 M3: M2 + Tor roundtrip + mock relay publish/subscribe
+M3.5: M3 + NIP-59 official vectors + no long-term pubkey in DM events/filters (regression test)
 M4: M3 + storage save/load roundtrip + wrong-passphrase rejection
 M5: M4 + 1:1 message roundtrip (mock relay) + MLS group tests
 M6: M5 + e2e test (local relay + Tor) + all benchmarks within budget
@@ -827,4 +869,5 @@ M9: M8 + cross-compile to aarch64-linux-android + aarch64-apple-ios + UniFFI bin
 | BIP-32 key derivation incompatible with NIP-06 | Low | High | M0 test gate enforces exact NIP-06 pubkey vectors before any M1+ code merges |
 | APNs/FCM push metadata subpoenaed by governments | High | Low | Payload carries no content; timing metadata is residual and unavoidable on stock iOS/Android |
 | UnifiedPush distributor unavailable on target device | Medium | Low | Fall back to FCM/APNs automatically; UnifiedPush is opt-in enhancement, not a hard requirement |
-| `fury-push` proxy correlates device tokens to identities | Low | High | Registration uses opaque random token; proxy never sees pubkeys — correlation is architecturally impossible |
+| `fury-push` proxy correlates device tokens to identities | High | High | The proxy sees each event's recipient `#p` tag, so it *can* link token to pubkey. Recommend a self-hosted proxy or UnifiedPush; pairwise receiving keys (SECURITY.md step 5) remove the link to the npub |
+| Communication graph visible to relays and third parties | Certain (today) | High | M3.5: NIP-17 / NIP-59 gift wrap, `#p`-only subscriptions, AUTH-protected inbox relays; CI regression test |

@@ -107,7 +107,8 @@ User types message
 Tor Network  ←── sees: encrypted onion traffic only (IP hidden, content hidden)
        │
        ▼
-Nostr Relay  ←── sees: signed event (cannot see user IP)
+Nostr Relay  ←── sees: signed event (cannot see user IP; today it does see sender and
+                 recipient pubkeys — fixed by NIP-17 gift wrap, see SECURITY.md)
        │
        ▼
 Recipient fetches via their own Arti stream → decrypts with NIP-44 key
@@ -145,7 +146,7 @@ fury/
 │       └── main.rs       # generate / show / import (stub)
 └── fury-chat/            # Two-terminal encrypted chat CLI  ✅
     └── src/
-        └── main.rs       # NIP-44 send/receive via live relay (no Tor yet)
+        └── main.rs       # NIP-44 send/receive via live relay, Tor-routed
 ```
 
 ---
@@ -155,20 +156,14 @@ fury/
 ### Done ✅
 1. **`FuryIdentity`** — BIP-39 → BIP-32 (NIP-06 path) → BIP-340 Schnorr, mlock, ECDH shared secret
 2. **`NostrEvent`** — NIP-01 canonical JSON, SHA-256 ID, Schnorr sign + verify
-3. **`nip44`** — Full NIP-44 v2: `conversation_key` (ECDH + HKDF-extract), `encrypt`/`decrypt` (per-message HKDF-expand → ChaCha20-Poly1305 + HMAC-SHA256)
+3. **`nip44`** — Full NIP-44 v2: `conversation_key` (ECDH + HKDF-extract), `encrypt`/`decrypt` (per-message HKDF-expand → ChaCha20 stream cipher + HMAC-SHA256; no Poly1305)
 4. **Multi-path wallet keys** — EVM (`m/44'/60'/0'/0/0`) and BTC (`m/44'/0'/0'/0/0`) key derivation with mlock; `npub()` NIP-19 bech32 encoding
 5. **`fury-sign`** — CLI stub (generate/show/import planned)
-6. **`fury-chat`** — Two-terminal encrypted chat demo over live relay (no Tor yet)
+6. **`fury-chat`** — Two-terminal encrypted chat demo over live relay
+7. **Tor transport** (`fury-core/src/transport.rs`) — all relay connections through Arti (embedded Tor, no daemon). Privacy invariant: no `connect_direct()`; a `TorClient` is required to build a `RelayClient`.
 
-### Step 1 — Tor transport (`fury-core/src/transport.rs`)
-Route all relay connections through Arti (embedded Tor, no daemon):
-```rust
-let tor = TorClient::create_bootstrapped(TorClientConfig::default()).await?;
-let stream = tor.connect((relay_host, relay_port)).await?;  // DataStream: AsyncRead+AsyncWrite
-let (ws, _) = tokio_tungstenite::client_async_tls(relay_url, stream).await?;
-```
-Replace the direct `connect_async` calls in `fury-chat/main.rs` with Tor-routed streams.
-Privacy invariant: no `connect_direct()` — `TorClient` is mandatory.
+### Step 1 — Metadata-private DMs (NIP-17 / NIP-59)
+Kind-4 DMs currently expose the sender and recipient pubkeys to relays and to anyone who queries them. Replace them with NIP-17 gift-wrapped messages: a kind-14 rumor, sealed in kind 13, wrapped in kind 1059 under a one-time key with a randomised `created_at`. Subscribe only by `#p`, with no `authors` filter. Publish a kind-10050 inbox relay list. Full plan in [SECURITY.md](SECURITY.md#communication-graph-leak).
 
 ### Step 2 — Persistence (`fury-sign/src/storage.rs`)
 Encrypted at-rest mnemonic:
